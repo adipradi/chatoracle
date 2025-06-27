@@ -4,120 +4,173 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from typing import Dict, List
-import logging
+import re
 
-def generate_sql_query(question: str, tables_info: List[Dict], chat_history: list, metabase_client, database_id: int):
+def filter_relevant_tables(question: str, tables_info: List[Dict], max_tables: int = 5) -> List[Dict]:
+    """Filter tables based on question relevance"""
+    question_lower = question.lower()
+    
+    # Define keyword mappings to table patterns
+    keyword_table_mapping = {
+        # Sales/Transaction keywords
+        'sales': ['transaction', 'sales', 'order', 'invoice', 'payment'],
+        'penjualan': ['transaction', 'sales', 'order', 'invoice', 'payment'],
+        'transaksi': ['transaction', 'sales', 'order', 'invoice'],
+        'omzet': ['transaction', 'sales', 'revenue'],
+        
+        # Customer keywords
+        'customer': ['customer', 'client', 'user', 'member'],
+        'pelanggan': ['customer', 'client', 'user', 'member'],
+        'pembeli': ['customer', 'buyer', 'client'],
+        
+        # Product keywords
+        'produk': ['product', 'item', 'goods', 'inventory'],
+        'barang': ['product', 'item', 'goods', 'inventory'],
+        'item': ['product', 'item', 'goods'],
+        
+        # Financial keywords
+        'revenue': ['revenue', 'income', 'financial', 'accounting'],
+        'profit': ['profit', 'margin', 'financial'],
+        'keuangan': ['financial', 'accounting', 'payment'],
+        
+        # Time-based keywords
+        'monthly': ['transaction', 'sales', 'revenue', 'report'],
+        'bulanan': ['transaction', 'sales', 'revenue', 'report'],
+        'yearly': ['transaction', 'sales', 'revenue', 'report'],
+    }
+    
+    # Score tables based on relevance
+    table_scores = []
+    
+    for table in tables_info:
+        score = 0
+        table_name = table['table'].lower()
+        
+        # Check if table name matches question keywords
+        for keyword, patterns in keyword_table_mapping.items():
+            if keyword in question_lower:
+                for pattern in patterns:
+                    if pattern in table_name:
+                        score += 10
+                        break
+        
+        # Boost score for main business tables
+        main_table_indicators = ['transaction', 'sales', 'order', 'customer', 'product']
+        for indicator in main_table_indicators:
+            if indicator in table_name:
+                score += 5
+        
+        # Check field relevance if available
+        if table.get('fields'):
+            relevant_fields = 0
+            for field in table['fields']:
+                field_name = field.get('name', '').lower()
+                # Count relevant fields based on question
+                if any(keyword in question_lower and keyword in field_name 
+                       for keyword in ['price', 'total', 'amount', 'quantity', 'date', 'name']):
+                    relevant_fields += 1
+            score += relevant_fields * 2
+        
+        table_scores.append((table, score))
+    
+    # Sort by score and return top tables
+    table_scores.sort(key=lambda x: x[1], reverse=True)
+    return [table for table, score in table_scores[:max_tables] if score > 0]
+
+def generate_sql_query_optimized(question: str, tables_info: List[Dict], chat_history: list, metabase_client, database_id: int):
     try:
-        # Initialize session state if not exists
+        # Initialize session state
         if 'table_structure_analyzed' not in st.session_state:
             st.session_state.table_structure_analyzed = False
         
-        # Build comprehensive schema information
+        # Filter relevant tables (max 5 tables)
+        relevant_tables = filter_relevant_tables(question, tables_info, max_tables=5)
+        
+        if not relevant_tables:
+            # If no relevant tables found, use top 3 main tables
+            main_table_keywords = ['transaction', 'sales', 'customer', 'product', 'order']
+            relevant_tables = []
+            for table in tables_info:
+                if any(keyword in table['table'].lower() for keyword in main_table_keywords):
+                    relevant_tables.append(table)
+                    if len(relevant_tables) >= 3:
+                        break
+            
+            if not relevant_tables:
+                relevant_tables = tables_info[:3]  # Fallback to first 3 tables
+        
+        st.info(f"Menggunakan {len(relevant_tables)} tabel yang relevan dari {len(tables_info)} tabel total")
+        
+        # Build schema for relevant tables only
         schema_details = ""
         main_table = None
         
-        for table in tables_info:
+        for table in relevant_tables:
             table_name = f"{table['schema']}.{table['table']}"
             schema_details += f"\nTable: {table_name}\n"
             
             if table.get('fields'):
-                schema_details += "Columns:\n"
-                for field in table['fields']:
+                # Limit fields to most important ones (max 15 per table)
+                important_fields = prioritize_fields(table['fields'])
+                schema_details += "Key Columns:\n"
+                
+                for field in important_fields[:15]:  # Limit to 15 fields
                     field_name = field.get('name', 'Unknown')
                     field_type = field.get('type', 'Unknown')
                     display_name = field.get('display_name', field_name)
                     schema_details += f"  - {field_name} ({field_type}) - {display_name}\n"
                 
-                # Set main table for sales data
+                # Set main table
                 if 'transaction' in table['table'].lower() or 'sales' in table['table'].lower():
                     main_table = table_name
             
             schema_details += "\n"
         
-        # If no main table identified, use the first available table
-        if not main_table and tables_info:
-            main_table = f"{tables_info[0]['schema']}.{tables_info[0]['table']}"
+        # Use first relevant table as main if not found
+        if not main_table and relevant_tables:
+            main_table = f"{relevant_tables[0]['schema']}.{relevant_tables[0]['table']}"
         
-        # Analyze table structure if needed
-        if main_table and not st.session_state.table_structure_analyzed:
-            try:
-                with st.spinner("Menganalisis struktur tabel..."):
-                    structure_info = metabase_client.analyze_table_structure(database_id, main_table)
-                    if structure_info:
-                        st.session_state.table_structure_analyzed = True
-                        schema_details += f"\nTable Analysis for {main_table}:\n"
-                        schema_details += f"- Total columns: {len(structure_info.get('columns', []))}\n"
-                        schema_details += f"- Sample data available: {len(structure_info.get('sample_data', []))} rows\n"
-                        if 'total_rows' in structure_info:
-                            schema_details += f"- Estimated total rows: {structure_info['total_rows']}\n"
-            except Exception as e:
-                logging.warning(f"Failed to analyze table structure: {e}")
-                # Continue without structure analysis
-        
+        # Rest of the function remains the same...
         prompt = ChatPromptTemplate.from_template("""
-You are an expert SQL analyst. Generate a precise SQL query to answer the user's question based on the provided database schema.
+You are an expert SQL analyst. Generate a precise SQL query using ONLY the relevant tables provided.
 
-Database Schema Information:
+Available Tables Schema:
 {schema_details}
 
-Main Table: {main_table}
+Primary Table: {main_table}
 
 User Question: {question}
 
 Previous Context: {chat_context}
 
-SQL Generation Rules:
-1. Generate ONLY the SQL query, no explanations or markdown
-2. Use proper table names with schema prefixes
-3. For sales/revenue questions, focus on TOTAL_PRICE, QUANTITY, PRICE columns
-4. For customer analysis, use CUSTOMER_NAME, CUSTOMER_CITY, CUSTOMER_PROVINCE
-5. For product analysis, use ITEM_DESCRIPTION, ITEM_CODE, ITEM_TYPE
-6. For time-based analysis, use REQUEST_DATE or CREATION_DATE
-7. Use appropriate aggregate functions (SUM, COUNT, AVG, MAX, MIN)
-8. Include proper GROUP BY clauses when aggregating
-9. Use ORDER BY for ranking/sorting results
-10. Add LIMIT clause for top/bottom results
-11. Handle NULL values appropriately
-12. Use proper date formatting and filtering
-
-Query Generation Strategy:
-- Identify key entities in the question (customer, product, time period, metric)
-- Determine required aggregations and groupings
-- Select appropriate columns for the analysis
-- Apply filters based on question context
-- Sort results meaningfully
+IMPORTANT RULES:
+1. Use ONLY the tables and columns listed above
+2. Generate ONLY the SQL query, no explanations
+3. Focus on the most relevant tables for the question
+4. Use proper JOINs when multiple tables are needed
+5. Include appropriate WHERE, GROUP BY, ORDER BY clauses
+6. Add LIMIT for large result sets
 
 Generate the SQL query:
 """)
         
-        # Initialize LLM with error handling
-        try:
-            llm = ChatOpenAI(
-                model="mistralai/mistral-small-3.2-24b-instruct:free", 
-                temperature=0,
-                timeout=30  # Add timeout
-            )
-        except Exception as e:
-            logging.error(f"Failed to initialize LLM: {e}")
-            raise
-        
+        llm = ChatOpenAI(model="mistralai/mistral-small-3.2-24b-instruct:free", temperature=0)
         chain = prompt | llm | StrOutputParser()
         
-        # Prepare chat context
+        # Prepare chat context (keep it short)
         chat_context = ""
         if len(chat_history) > 2:
-            recent_messages = chat_history[-4:]  # Last 2 Q&A pairs
+            recent_messages = chat_history[-2:]  # Only last Q&A pair
             for msg in recent_messages:
                 if isinstance(msg, HumanMessage):
-                    chat_context += f"Q: {msg.content}\n"
+                    chat_context += f"Q: {msg.content[:50]}...\n"
                 elif isinstance(msg, AIMessage):
-                    chat_context += f"A: {msg.content[:100]}...\n"
+                    chat_context += f"A: {msg.content[:50]}...\n"
         
-        # Generate SQL query
         sql_query = chain.invoke({
             "question": question,
             "schema_details": schema_details,
-            "main_table": main_table or "mb.khs_customer_transactions",
+            "main_table": main_table,
             "chat_context": chat_context
         })
         
@@ -128,79 +181,37 @@ Generate the SQL query:
         elif sql_query.startswith("```"):
             sql_query = sql_query.replace("```", "").strip()
         
-        # Validate SQL query is not empty
-        if not sql_query:
-            raise ValueError("Generated SQL query is empty")
-        
         return sql_query
         
     except Exception as e:
-        logging.error(f"SQL generation failed: {e}")
         st.warning(f"SQL generation failed: {e}")
-        
-        # Intelligent fallback based on question content
         return _generate_fallback_query(question)
 
+def prioritize_fields(fields: List[Dict]) -> List[Dict]:
+    """Prioritize most important fields"""
+    priority_keywords = [
+        'id', 'name', 'date', 'time', 'price', 'total', 'amount', 
+        'quantity', 'status', 'type', 'code', 'description', 'customer',
+        'product', 'item', 'created', 'updated'
+    ]
+    
+    prioritized = []
+    remaining = []
+    
+    for field in fields:
+        field_name = field.get('name', '').lower()
+        if any(keyword in field_name for keyword in priority_keywords):
+            prioritized.append(field)
+        else:
+            remaining.append(field)
+    
+    return prioritized + remaining
+
 def _generate_fallback_query(question: str) -> str:
-    """Generate fallback SQL queries based on question keywords"""
+    """Generate fallback SQL queries"""
     question_lower = question.lower()
     
-    # Sales/Revenue queries
-    if any(word in question_lower for word in ["penjualan", "sales", "revenue", "omzet"]):
-        if any(word in question_lower for word in ["tertinggi", "terbesar", "highest", "top"]):
-            return """
-            SELECT CUSTOMER_NAME, SUM(TOTAL_PRICE) as total_sales 
-            FROM mb.khs_customer_transactions 
-            GROUP BY CUSTOMER_NAME 
-            ORDER BY total_sales DESC 
-            LIMIT 10
-            """.strip()
-        elif any(word in question_lower for word in ["bulan", "month", "bulanan"]):
-            return """
-            SELECT EXTRACT(MONTH FROM REQUEST_DATE) as month, 
-                   SUM(TOTAL_PRICE) as monthly_sales 
-            FROM mb.khs_customer_transactions 
-            GROUP BY EXTRACT(MONTH FROM REQUEST_DATE) 
-            ORDER BY month
-            """.strip()
-        else:
-            return """
-            SELECT CUSTOMER_NAME, ITEM_DESCRIPTION, TOTAL_PRICE, REQUEST_DATE 
-            FROM mb.khs_customer_transactions 
-            ORDER BY TOTAL_PRICE DESC 
-            LIMIT 20
-            """.strip()
-    
-    # Customer queries
-    elif any(word in question_lower for word in ["customer", "pelanggan", "pembeli"]):
-        return """
-        SELECT CUSTOMER_NAME, CUSTOMER_CITY, 
-               COUNT(*) as transaction_count, 
-               SUM(TOTAL_PRICE) as total_spent 
-        FROM mb.khs_customer_transactions 
-        GROUP BY CUSTOMER_NAME, CUSTOMER_CITY 
-        ORDER BY total_spent DESC 
-        LIMIT 15
-        """.strip()
-    
-    # Product queries
-    elif any(word in question_lower for word in ["produk", "product", "item", "barang"]):
-        return """
-        SELECT ITEM_DESCRIPTION, 
-               COUNT(*) as sold_count, 
-               SUM(QUANTITY) as total_quantity, 
-               SUM(TOTAL_PRICE) as total_revenue 
-        FROM mb.khs_customer_transactions 
-        GROUP BY ITEM_DESCRIPTION 
-        ORDER BY total_revenue DESC 
-        LIMIT 15
-        """.strip()
-    
-    # Default query
+    if any(word in question_lower for word in ["penjualan", "sales", "revenue"]):
+        return "SELECT * FROM (SELECT table_name FROM information_schema.tables WHERE table_name LIKE '%transaction%' OR table_name LIKE '%sales%' LIMIT 1) LIMIT 10"
     else:
-        return """
-        SELECT * 
-        FROM mb.khs_customer_transactions 
-        ORDER BY REQUEST_DATE DESC 
-        LIMIT 10
-        """.strip()
+        return "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' LIMIT 10"
